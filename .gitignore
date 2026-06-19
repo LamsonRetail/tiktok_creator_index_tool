@@ -1,0 +1,25 @@
+# ==== Dữ liệu nhạy cảm / phiên đăng nhập — KHÔNG đẩy lên git ====
+chrome_profiles/
+**/tt_auth_state.json
+**/RESULT_*.xlsx
+
+# ==== Dump API (chứa token msToken/X-Bogus & dữ liệu thật) ====
+api_dumps/
+
+# ==== Dữ liệu đầu vào của người dùng ====
+creators.xlsx
+*.xlsx
+
+# ==== Python ====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ==== IDE / OS ====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
