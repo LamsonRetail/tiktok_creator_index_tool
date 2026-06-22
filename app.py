@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import time
 import threading
 import subprocess
@@ -13,7 +14,8 @@ from driver_manager import (
     get_worker_profile_dir,
     get_user_dir,
 )
-from parallel_crawler import export_auth_state, worker_crawl, FIELD_CATALOG
+from parallel_crawler import export_auth_state, worker_crawl, FIELD_CATALOG, import_auth_state
+import aff_index
 
 # ===============================
 # HELPER: CHỈ ĐÓNG CHROME CỦA TOOL
@@ -191,7 +193,7 @@ with st.sidebar:
 st.markdown('<p class="main-header">TIKTOK CRAWLER CREATOR INDEX</p>', unsafe_allow_html=True)
 st.markdown('<p style="opacity:0.6; text-transform:uppercase; letter-spacing:1px; font-size:0.8rem; margin-top:-15px; margin-bottom:40px;">Advanced Intelligence Extraction System</p>', unsafe_allow_html=True)
 
-tab_extract, tab_control = st.tabs(["EXTRACTION HUB", "ADMIN SETTINGS"])
+tab_extract, tab_aff, tab_control = st.tabs(["CREATOR INDEX", "AFF INDEXS", "ADMIN SETTINGS"])
 
 with tab_extract:
     if os.path.exists(auth_state_path):
@@ -400,6 +402,541 @@ with tab_extract:
             st.caption("Bảng kết quả (bấm vào ô / kéo chọn để copy, hoặc dùng nút Copy ở góc bảng):")
             st.dataframe(df_res.rename(columns=_labels), use_container_width=True, hide_index=True)
 
+with tab_aff:
+    # ===============================
+    # AFF INDEXS — chọn base bất kỳ + paste link
+    # ===============================
+    if not os.path.exists(auth_state_path):
+        st.warning("Chưa có phiên TikTok. Vào tab ADMIN SETTINGS đăng nhập và SAVE SESSION DATA trước.")
+    else:
+        try:
+            _identity = (dict(st.secrets["lark"]).get("identity") if "lark" in st.secrets else "user") or "user"
+        except Exception:
+            _identity = "user"
+
+        # Cảnh báo nếu chưa cấu hình Shop ID (KOL gửi link gốc tiktok.com sẽ thiếu shop_id)
+        _shop_cfg_top = aff_index.load_shop_config(ADMIN_KEY)
+        if not _shop_cfg_top.get("shop_id"):
+            st.warning(
+                "Chưa cấu hình **Shop ID** trong ADMIN SETTINGS. "
+                "Các link KOL gửi từ trang TikTok cá nhân (không có `?shop_id=...`) sẽ báo lỗi. "
+                "Vào tab ADMIN SETTINGS → mục **AFF SHOP CONFIG** để lưu Shop ID 1 lần."
+            )
+        else:
+            _cache_size = len(aff_index.load_creator_cache(ADMIN_KEY))
+            st.info(
+                f"Khi bấm EXECUTE, hệ thống sẽ tự mở `affiliate.tiktok.com/connection/creator` "
+                f"và quét toàn bộ KOL collab của shop để nạp creator_id vào cache "
+                f"(hiện đang có **{_cache_size}** username trong cache). "
+                f"Không cần đụng vào trang TikTok public hay nhập thủ công."
+            )
+
+        mode_a, mode_b = st.tabs(["TỪ LARK BASE", "DÁN LINK"])
+
+        # =============================================================
+        # MODE A: chọn base bất kỳ, chọn cột link, paginate 40/page,
+        #         execute → auto-tạo cột metric + ghi đè cùng dòng.
+        # =============================================================
+        with mode_a:
+            ca_left, ca_right = st.columns([1.8, 1])
+            with ca_left:
+                st.markdown("#### 1. CONNECTION")
+                base_input = st.text_input(
+                    "Lark Base URL hoặc base_token",
+                    placeholder="https://xxx.larksuite.com/base/XXXXXXXXXXXXX  hoặc  XXXXXXXXXXXXX",
+                    key="aff_base_input",
+                )
+
+                def _connect_base(raw_input: str):
+                    token = aff_index.extract_base_token(raw_input)
+                    if not token:
+                        st.error("Vui lòng dán URL Lark Base hoặc base_token.")
+                        return
+                    try:
+                        with st.spinner("Kết nối Lark, đọc bảng & records..."):
+                            info = aff_index.lark_base_get(token, identity=_identity)
+                            tables = aff_index.lark_list_tables(token, identity=_identity)
+                            if not tables:
+                                st.error("Base không có bảng nào.")
+                                return
+                            # nếu URL có ?table=tbl... thì ưu tiên dùng làm bảng mặc định
+                            hint_tid = aff_index.extract_table_id_hint(raw_input)
+                            first_tid = hint_tid if any(t["table_id"] == hint_tid for t in tables) else tables[0]["table_id"]
+                            fields = aff_index.lark_list_fields(token, first_tid, identity=_identity)
+                            records = aff_index.lark_list_all_records(token, first_tid, identity=_identity)
+                        st.session_state.aff_base_token = token
+                        st.session_state.aff_base_info = info
+                        st.session_state.aff_tables = tables
+                        st.session_state.aff_table_id = first_tid
+                        st.session_state.aff_fields = fields
+                        st.session_state.aff_records = records
+                        st.session_state.aff_link_field = None
+                        st.session_state.aff_page = 1
+                        st.session_state.aff_selected_rids = set()
+                        st.session_state.pop("aff_last_results", None)
+                    except Exception as e:
+                        st.error(f"Không kết nối được: {e}")
+
+                if st.button("CONNECT", key="aff_connect_btn", use_container_width=True):
+                    _connect_base(base_input)
+
+                if st.session_state.get("aff_base_token"):
+                    info = st.session_state.get("aff_base_info") or {}
+                    tables = st.session_state.get("aff_tables") or []
+                    st.success(f"{info.get('name') or st.session_state.aff_base_token}  ·  {len(tables)} bảng")
+
+                    st.markdown("#### 2. CHỌN BẢNG & CỘT LINK")
+                    tbl_ids = [t["table_id"] for t in tables]
+                    cur_tid = st.session_state.get("aff_table_id") or tbl_ids[0]
+                    tbl_index_default = tbl_ids.index(cur_tid) if cur_tid in tbl_ids else 0
+                    sel_tbl_idx = st.selectbox(
+                        "Bảng dữ liệu:",
+                        options=list(range(len(tables))),
+                        index=tbl_index_default,
+                        format_func=lambda i: tables[i]["name"],
+                        key="aff_tbl_select",
+                    )
+                    chosen_tid = tables[sel_tbl_idx]["table_id"]
+                    if chosen_tid != st.session_state.get("aff_table_id"):
+                        try:
+                            with st.spinner("Đang tải records..."):
+                                fields = aff_index.lark_list_fields(
+                                    st.session_state.aff_base_token, chosen_tid, identity=_identity,
+                                )
+                                records = aff_index.lark_list_all_records(
+                                    st.session_state.aff_base_token, chosen_tid, identity=_identity,
+                                )
+                            st.session_state.aff_table_id = chosen_tid
+                            st.session_state.aff_fields = fields
+                            st.session_state.aff_records = records
+                            st.session_state.aff_link_field = None
+                            st.session_state.aff_page = 1
+                            st.session_state.aff_selected_rids = set()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Đọc bảng lỗi: {e}")
+
+                    fields = st.session_state.get("aff_fields") or []
+                    field_names = [f["name"] for f in fields if f.get("name")]
+                    if not field_names:
+                        st.info("Bảng này chưa có cột nào.")
+                    else:
+                        default_idx = 0
+                        for i, n in enumerate(field_names):
+                            if "link" in n.lower():
+                                default_idx = i; break
+                        link_field = st.selectbox(
+                            "Cột chứa link video TikTok:",
+                            options=field_names, index=default_idx,
+                            key="aff_link_field_select",
+                        )
+                        st.session_state.aff_link_field = link_field
+
+                        # cột creator_id (tuỳ chọn): nếu có sẵn dữ liệu sẽ bỏ qua resolve qua TikTok public
+                        cid_opts = ["(không dùng)"] + field_names
+                        cid_default = 0
+                        for i, n in enumerate(field_names):
+                            if "creator_id" in n.lower() or "creator id" in n.lower():
+                                cid_default = i + 1; break
+                        cid_field_choice = st.selectbox(
+                            "Cột creator_id (tuỳ chọn — nếu đã điền sẽ bỏ qua bước resolve):",
+                            options=cid_opts, index=cid_default,
+                            key="aff_cid_field_select",
+                        )
+                        st.session_state.aff_cid_field = (
+                            None if cid_field_choice == "(không dùng)" else cid_field_choice
+                        )
+
+                        records = st.session_state.get("aff_records") or []
+                        eligible = [r for r in records
+                                    if aff_index.extract_link_value((r.get("fields") or {}).get(link_field))]
+
+                        st.markdown(f"#### 3. RECORDS  ·  {len(eligible)} dòng có link / {len(records)} tổng")
+
+                        if not eligible:
+                            st.info(f"Không có dòng nào có dữ liệu ở cột `{link_field}`.")
+                        else:
+                            PAGE_SIZE = 40
+                            total_pages = max(1, (len(eligible) + PAGE_SIZE - 1) // PAGE_SIZE)
+                            page = int(st.session_state.get("aff_page", 1))
+                            page = max(1, min(page, total_pages))
+
+                            if not isinstance(st.session_state.get("aff_selected_rids"), set):
+                                st.session_state.aff_selected_rids = set()
+                            sel_set: set = st.session_state.aff_selected_rids
+
+                            # thanh chọn / bỏ chọn trang + refresh
+                            cs1, cs2, cs3, cs4 = st.columns([1, 1, 1, 2])
+                            with cs1:
+                                if st.button("Chọn cả trang", key="aff_sel_page", use_container_width=True):
+                                    for r in eligible[(page-1)*PAGE_SIZE: page*PAGE_SIZE]:
+                                        sel_set.add(r["record_id"])
+                                    st.rerun()
+                            with cs2:
+                                if st.button("Bỏ chọn trang", key="aff_unsel_page", use_container_width=True):
+                                    for r in eligible[(page-1)*PAGE_SIZE: page*PAGE_SIZE]:
+                                        sel_set.discard(r["record_id"])
+                                    st.rerun()
+                            with cs3:
+                                if st.button("Xoá lựa chọn", key="aff_sel_clear", use_container_width=True):
+                                    sel_set.clear()
+                                    st.rerun()
+                            with cs4:
+                                if st.button("REFRESH RECORDS", key="aff_refresh_records",
+                                             use_container_width=True, type="secondary"):
+                                    try:
+                                        with st.spinner("Đang tải lại records từ Lark..."):
+                                            st.session_state.aff_records = aff_index.lark_list_all_records(
+                                                st.session_state.aff_base_token,
+                                                st.session_state.aff_table_id,
+                                                identity=_identity,
+                                            )
+                                        st.session_state.aff_page = 1
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Refresh lỗi: {e}")
+
+                            page_records = eligible[(page-1)*PAGE_SIZE: page*PAGE_SIZE]
+                            preview_field_names = [n for n in field_names if n != link_field][:3]
+                            rows = []
+                            for r in page_records:
+                                f = r.get("fields") or {}
+                                row = {
+                                    "Chọn": r["record_id"] in sel_set,
+                                    link_field: aff_index.extract_link_value(f.get(link_field)),
+                                }
+                                for n in preview_field_names:
+                                    v = f.get(n)
+                                    if isinstance(v, (dict, list)):
+                                        try: v = json.dumps(v, ensure_ascii=False)
+                                        except Exception: v = str(v)
+                                    row[n] = "" if v is None else str(v)
+                                row["_rid"] = r["record_id"]
+                                rows.append(row)
+                            df_page = pd.DataFrame(rows)
+
+                            edited = st.data_editor(
+                                df_page,
+                                hide_index=True,
+                                use_container_width=True,
+                                column_config={
+                                    "Chọn": st.column_config.CheckboxColumn(width="small"),
+                                    link_field: st.column_config.LinkColumn(),
+                                    "_rid": None,
+                                },
+                                disabled=[link_field] + preview_field_names,
+                                key=f"aff_editor_page_{page}",
+                            )
+                            for _, row in edited.iterrows():
+                                rid = row["_rid"]
+                                if row["Chọn"]:
+                                    sel_set.add(rid)
+                                else:
+                                    sel_set.discard(rid)
+
+                            # ----- PAGINATION đơn giản: < 1 2 3 ... > -----
+                            def _render_pagination(cur: int, total: int):
+                                # tối đa 7 nút số trang quanh trang hiện tại
+                                window = 5
+                                if total <= window + 2:
+                                    pages = list(range(1, total + 1))
+                                else:
+                                    half = window // 2
+                                    start = max(1, cur - half)
+                                    end = min(total, start + window - 1)
+                                    start = max(1, end - window + 1)
+                                    pages = list(range(start, end + 1))
+                                    if pages[0] > 1:
+                                        pages = [1, "…"] + pages
+                                    if pages[-1] < total:
+                                        pages = pages + ["…", total]
+
+                                btns = ["<"] + pages + [">"]
+                                cols = st.columns(len(btns))
+                                for idx, b in enumerate(btns):
+                                    with cols[idx]:
+                                        if b == "<":
+                                            if st.button("<", key=f"aff_pg_prev_{cur}",
+                                                         disabled=(cur <= 1), use_container_width=True):
+                                                st.session_state.aff_page = cur - 1
+                                                st.rerun()
+                                        elif b == ">":
+                                            if st.button(">", key=f"aff_pg_next_{cur}",
+                                                         disabled=(cur >= total), use_container_width=True):
+                                                st.session_state.aff_page = cur + 1
+                                                st.rerun()
+                                        elif b == "…":
+                                            st.markdown("<div style='text-align:center;opacity:0.5;padding-top:10px'>…</div>",
+                                                        unsafe_allow_html=True)
+                                        else:
+                                            label = str(b)
+                                            if b == cur:
+                                                st.markdown(
+                                                    f"<div style='text-align:center;padding:8px 0;"
+                                                    f"background:linear-gradient(90deg,#FF0050,#ad1457);"
+                                                    f"color:white;border-radius:8px;font-weight:600;'>{label}</div>",
+                                                    unsafe_allow_html=True,
+                                                )
+                                            else:
+                                                if st.button(label, key=f"aff_pg_{b}_{cur}", use_container_width=True):
+                                                    st.session_state.aff_page = int(b)
+                                                    st.rerun()
+
+                            st.caption(f"Trang {page}/{total_pages}  ·  đã chọn {len(sel_set)} dòng")
+                            _render_pagination(page, total_pages)
+
+                            st.markdown("#### 4. EXECUTION")
+                            is_busy_a, runner_a = sys_lock.get_status()
+                            if st.session_state.get("aff_running"):
+                                st.info("Đang xử lý — đừng F5 / chuyển tab cho đến khi xong.")
+                            elif is_busy_a:
+                                st.button(f"SYSTEM OCCUPIED BY {runner_a.upper()}",
+                                          disabled=True, use_container_width=True)
+                            elif st.button(
+                                f"EXECUTE · LẤY SỐ LIỆU & GHI VÀO BASE  ({len(sel_set)} dòng)",
+                                disabled=(len(sel_set) == 0),
+                                use_container_width=True, type="primary",
+                                key="aff_run_btn",
+                            ):
+                                if sys_lock.try_acquire("aff_index"):
+                                    st.session_state.aff_running = True
+                                    st.session_state.aff_selected_snapshot = list(sel_set)
+                                    st.rerun()
+
+                            if st.session_state.get("aff_running"):
+                                sel_rids = st.session_state.get("aff_selected_snapshot", [])
+                                rid_set = set(sel_rids)
+                                selected = [r for r in eligible if r["record_id"] in rid_set]
+                                prog = st.progress(0.0)
+                                status_box = st.empty()
+                                results = []
+                                driver = None
+                                try:
+                                    status_box.write("Kiểm tra & tạo cột metric nếu thiếu...")
+                                    ensure_report = aff_index.lark_ensure_metric_fields(
+                                        st.session_state.aff_base_token,
+                                        st.session_state.aff_table_id,
+                                        identity=_identity,
+                                    )
+                                    created = [k for k, v in ensure_report.items() if v == "created"]
+                                    if created:
+                                        status_box.write(f"Đã tạo {len(created)} cột mới: {', '.join(created)}")
+                                    else:
+                                        status_box.write("Tất cả cột metric đã có sẵn.")
+
+                                    driver = init_driver(get_login_profile_dir(ADMIN_KEY))
+                                    import_auth_state(driver, auth_state_path)
+
+                                    def _cb(i, label, msg):
+                                        try:
+                                            prog.progress(min((i + 1) / max(len(selected), 1), 1.0))
+                                            status_box.write(f"[{i+1}/{len(selected)}] {label}: {msg}")
+                                        except Exception:
+                                            pass
+
+                                    _shop_def = aff_index.load_shop_config(ADMIN_KEY)
+                                    results = aff_index.process_records_in_table(
+                                        driver,
+                                        {
+                                            "base_token": st.session_state.aff_base_token,
+                                            "table_id": st.session_state.aff_table_id,
+                                            "identity": _identity,
+                                        },
+                                        selected, st.session_state.aff_link_field,
+                                        progress_cb=_cb,
+                                        default_shop_id=_shop_def.get("shop_id") or None,
+                                        default_shop_region=_shop_def.get("shop_region") or "VN",
+                                        creator_id_field_name=st.session_state.get("aff_cid_field"),
+                                        admin_key=ADMIN_KEY,
+                                    )
+                                except Exception as e:
+                                    st.error(f"Lỗi vận hành: {e}")
+                                finally:
+                                    try:
+                                        if driver: driver.quit()
+                                    except Exception:
+                                        pass
+                                    sys_lock.release()
+                                    st.session_state.aff_running = False
+                                    st.session_state.aff_last_results = results
+                                    # reload records từ Lark để thấy số mới
+                                    try:
+                                        st.session_state.aff_records = aff_index.lark_list_all_records(
+                                            st.session_state.aff_base_token,
+                                            st.session_state.aff_table_id,
+                                            identity=_identity,
+                                        )
+                                    except Exception:
+                                        pass
+                                    st.session_state.aff_selected_rids = set()
+                                    st.rerun()
+
+                            if "aff_last_results" in st.session_state and not st.session_state.get("aff_running"):
+                                rs = st.session_state.aff_last_results
+                                ok = sum(1 for r in rs if r.get("ok"))
+                                err = len(rs) - ok
+                                st.success(f"Hoàn thành: {ok} OK · {err} lỗi")
+                                res_rows = []
+                                for r in rs:
+                                    if r.get("ok"):
+                                        m = r.get("metrics") or {}
+                                        res_rows.append({
+                                            "Link": r.get("label"), "Trạng thái": "OK",
+                                            "GMV": m.get("GMV video"), "Hoa hồng": m.get("Hoa hồng ước tính"),
+                                            "CTR (%)": m.get("CTR (%)"), "Lượt xem": m.get("Lượt xem"),
+                                            "Lượt thích": m.get("Lượt thích"), "Bình luận": m.get("Bình luận"),
+                                            "Sold": m.get("Số món bán ra"),
+                                        })
+                                    else:
+                                        res_rows.append({"Link": r.get("label"), "Trạng thái": f"LỖI: {r.get('error','')}",
+                                                         "GMV": None, "Hoa hồng": None, "CTR (%)": None,
+                                                         "Lượt xem": None, "Lượt thích": None,
+                                                         "Bình luận": None, "Sold": None})
+                                if res_rows:
+                                    st.dataframe(pd.DataFrame(res_rows), use_container_width=True, hide_index=True)
+
+            with ca_right:
+                st.markdown("#### HARDWARE INFO")
+                _busy_a, _ = sys_lock.get_status()
+                st.markdown(
+                    f"- **GATEWAY:** `{os.environ.get('COMPUTERNAME', 'SERVER-01')}`\n"
+                    f"- **STATUS:** `{'BUSY' if _busy_a else 'AVAILABLE'}`"
+                )
+                st.caption("Mặc định 40 dòng / trang. Tích vào ô Chọn ở các trang khác nhau đều được ghi nhận.")
+                st.caption("Số liệu lấy là **cửa sổ 7 ngày gần nhất**.")
+                st.caption("EXECUTE chỉ tạo cột metric **nếu chưa có** rồi ghi đè lên chính dòng đó, kèm cột **Ngày cập nhật**.")
+
+        # =============================================================
+        # MODE B: dán link → trả bảng + cho tải Excel/CSV (không ghi Lark)
+        # =============================================================
+        with mode_b:
+            cb_left, cb_right = st.columns([1.8, 1])
+            with cb_left:
+                st.markdown("#### 1. DÁN LINK")
+                paste_links = st.text_area(
+                    "Mỗi dòng một link video TikTok:",
+                    height=200, key="aff_paste_text",
+                    placeholder="https://www.tiktok.com/@user1/video/1234567890\nhttps://www.tiktok.com/@user2/video/0987654321",
+                )
+                link_list = [ln.strip() for ln in (paste_links or "").splitlines() if ln.strip()]
+                st.caption(f"Đã nhận **{len(link_list)}** link.")
+
+                st.markdown("#### 2. EXECUTION")
+                is_busy_b, runner_b = sys_lock.get_status()
+                if st.session_state.get("aff_paste_running"):
+                    st.info("Đang xử lý — đừng F5 / chuyển tab cho đến khi xong.")
+                elif is_busy_b:
+                    st.button(f"SYSTEM OCCUPIED BY {runner_b.upper()}",
+                              disabled=True, use_container_width=True, key="aff_paste_busy")
+                elif st.button(
+                    f"EXECUTE · LẤY SỐ LIỆU  ({len(link_list)} link)",
+                    disabled=(len(link_list) == 0),
+                    use_container_width=True, type="primary",
+                    key="aff_paste_run_btn",
+                ):
+                    if sys_lock.try_acquire("aff_paste"):
+                        st.session_state.aff_paste_running = True
+                        st.session_state.aff_paste_links = link_list
+                        st.rerun()
+
+                if st.session_state.get("aff_paste_running"):
+                    links = st.session_state.get("aff_paste_links", [])
+                    prog = st.progress(0.0)
+                    status_box = st.empty()
+                    results = []
+                    driver = None
+                    try:
+                        driver = init_driver(get_login_profile_dir(ADMIN_KEY))
+                        import_auth_state(driver, auth_state_path)
+
+                        def _cb_b(i, label, msg):
+                            try:
+                                prog.progress(min((i + 1) / max(len(links), 1), 1.0))
+                                status_box.write(f"[{i+1}/{len(links)}] {label}: {msg}")
+                            except Exception:
+                                pass
+
+                        _shop_def_b = aff_index.load_shop_config(ADMIN_KEY)
+                        results = aff_index.process_links_paste(
+                            driver, links, progress_cb=_cb_b,
+                            default_shop_id=_shop_def_b.get("shop_id") or None,
+                            default_shop_region=_shop_def_b.get("shop_region") or "VN",
+                            admin_key=ADMIN_KEY,
+                        )
+                    except Exception as e:
+                        st.error(f"Lỗi vận hành: {e}")
+                    finally:
+                        try:
+                            if driver: driver.quit()
+                        except Exception:
+                            pass
+                        sys_lock.release()
+                        st.session_state.aff_paste_running = False
+                        st.session_state.aff_paste_results = results
+                        st.rerun()
+
+                if "aff_paste_results" in st.session_state and not st.session_state.get("aff_paste_running"):
+                    rs = st.session_state.aff_paste_results
+                    ok = sum(1 for r in rs if r.get("ok"))
+                    err = len(rs) - ok
+                    st.success(f"Hoàn thành: {ok} OK · {err} lỗi")
+                    res_rows = []
+                    for r in rs:
+                        if r.get("ok"):
+                            res_rows.append({
+                                "Link": r.get("link"), "username": r.get("username"),
+                                "video_id": r.get("video_id"), "creator_id": r.get("creator_id"),
+                                "shop_id": r.get("shop_id"), "shop_region": r.get("shop_region"),
+                                "Tên video": r.get("Tên video"),
+                                "GMV video": r.get("GMV video"),
+                                "Hoa hồng ước tính": r.get("Hoa hồng ước tính"),
+                                "CTR (%)": r.get("CTR (%)"),
+                                "Lượt xem": r.get("Lượt xem"),
+                                "Lượt thích": r.get("Lượt thích"),
+                                "Bình luận": r.get("Bình luận"),
+                                "Số món bán ra": r.get("Số món bán ra"),
+                                "Trạng thái": "OK",
+                            })
+                        else:
+                            res_rows.append({
+                                "Link": r.get("link"), "username": None, "video_id": None,
+                                "creator_id": None, "shop_id": None, "shop_region": None,
+                                "Tên video": None,
+                                "GMV video": None, "Hoa hồng ước tính": None, "CTR (%)": None,
+                                "Lượt xem": None, "Lượt thích": None, "Bình luận": None,
+                                "Số món bán ra": None,
+                                "Trạng thái": f"LỖI: {r.get('error','')}",
+                            })
+                    if res_rows:
+                        df_res = pd.DataFrame(res_rows)
+                        st.dataframe(df_res, use_container_width=True, hide_index=True)
+                        cdl1, cdl2 = st.columns(2)
+                        with cdl1:
+                            _buf = io.BytesIO()
+                            df_res.to_excel(_buf, index=False, engine="openpyxl")
+                            st.download_button(
+                                "TẢI EXCEL (.xlsx)", data=_buf.getvalue(),
+                                file_name="AFF_METRICS.xlsx", use_container_width=True,
+                                key="aff_paste_dl_xlsx",
+                            )
+                        with cdl2:
+                            st.download_button(
+                                "TẢI CSV (.csv)",
+                                data=df_res.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="AFF_METRICS.csv", use_container_width=True,
+                                key="aff_paste_dl_csv",
+                            )
+
+            with cb_right:
+                st.markdown("#### HARDWARE INFO")
+                _busy_b2, _ = sys_lock.get_status()
+                st.markdown(
+                    f"- **GATEWAY:** `{os.environ.get('COMPUTERNAME', 'SERVER-01')}`\n"
+                    f"- **STATUS:** `{'BUSY' if _busy_b2 else 'AVAILABLE'}`"
+                )
+                st.caption("Mode này **không ghi** Lark. Kết quả chỉ hiển thị + tải file.")
+                st.caption("Chấp nhận link gốc `https://www.tiktok.com/@user/video/<id>` — shop_id sẽ tự lấy từ ADMIN SETTINGS.")
+
 with tab_control:
     st.markdown("#### ADMIN GATEWAY")
     pass_input = st.text_input("Credential:", type="password")
@@ -423,5 +960,75 @@ with tab_control:
                 sys_lock.force_reset()
                 st.session_state.job_running = False
                 st.rerun()
+
+        st.divider()
+        st.markdown("#### AFF SHOP CONFIG")
+        st.caption(
+            "KOL thường gửi link gốc dạng `https://www.tiktok.com/@user/video/<id>` (không có shop_id). "
+            "Lưu `Shop ID` của bạn 1 lần ở đây, các link thiếu shop_id sẽ tự động dùng giá trị này."
+        )
+        _shop_cfg = aff_index.load_shop_config(ADMIN_KEY)
+        sc1, sc2, sc3 = st.columns([3, 1, 1])
+        with sc1:
+            shop_id_input = st.text_input(
+                "Shop ID (TikTok Shop Affiliate)",
+                value=_shop_cfg.get("shop_id", ""),
+                placeholder="vd 7496137102397442781",
+                key="aff_shop_id_input",
+            )
+        with sc2:
+            shop_region_input = st.text_input(
+                "Shop Region",
+                value=_shop_cfg.get("shop_region", "VN"),
+                key="aff_shop_region_input",
+            )
+        with sc3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("SAVE", key="aff_save_shop_cfg", use_container_width=True):
+                try:
+                    aff_index.save_shop_config(shop_id_input, shop_region_input or "VN", ADMIN_KEY)
+                    st.success(f"Đã lưu: shop_id={shop_id_input}, region={shop_region_input or 'VN'}")
+                except Exception as e:
+                    st.error(f"Lưu lỗi: {e}")
+        st.caption(
+            "Lấy Shop ID: vào `affiliate.tiktok.com/data/creator-analysis` → mở 1 video bất kỳ → "
+            "copy giá trị `shop_id` trên URL."
+        )
+
+        st.divider()
+        st.markdown("#### CREATOR ID CACHE")
+        st.caption(
+            "TikTok thường bật login wall ở trang public → không tự lấy được `creator_id` từ link KOL gửi. "
+            "Lưu sẵn `username → creator_id` ở đây để bypass. "
+            "Lấy creator_id: vào `affiliate.tiktok.com/data/creator-analysis`, click vào 1 video của KOL đó, "
+            "copy giá trị `creator_id` trên URL."
+        )
+        _ccache = aff_index.load_creator_cache(ADMIN_KEY)
+        _cache_rows = [{"username": u, "creator_id": cid} for u, cid in _ccache.items()] or [
+            {"username": "", "creator_id": ""}
+        ]
+        edited_cache = st.data_editor(
+            pd.DataFrame(_cache_rows),
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "username": st.column_config.TextColumn(
+                    "Username", help="phần sau @ trong link (vd: kiendacheck)"),
+                "creator_id": st.column_config.TextColumn(
+                    "Creator ID", help="số dài, lấy từ URL creator-analysis"),
+            },
+            key="aff_creator_cache_editor",
+        )
+        if st.button("SAVE CACHE", key="aff_save_creator_cache", use_container_width=True):
+            new_cache = {}
+            for _, row in edited_cache.iterrows():
+                u = (str(row.get("username") or "")).strip().lower()
+                cid = (str(row.get("creator_id") or "")).strip()
+                if u and cid and cid.isdigit():
+                    new_cache[u] = cid
+            aff_index.save_creator_cache(new_cache, ADMIN_KEY)
+            st.success(f"Đã lưu {len(new_cache)} mục.")
+            st.rerun()
 
 st.markdown("<div style='text-align:center; margin-top:100px; opacity:0.5; font-size:0.8rem;'>Thien Quy Digital Trans | Elite Analytics 2025</div>", unsafe_allow_html=True)

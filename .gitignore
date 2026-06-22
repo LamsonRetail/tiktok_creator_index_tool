@@ -2,9 +2,21 @@
 chrome_profiles/
 **/tt_auth_state.json
 **/RESULT_*.xlsx
+**/aff_shop_config.json
+**/aff_creator_cache.json
+.streamlit/secrets.toml
 
 # ==== Dump API (chứa token msToken/X-Bogus & dữ liệu thật) ====
 api_dumps/
+
+# ==== Aff Indexs runtime tạm ====
+.tmp/
+
+# ==== Heartbeat log ====
+heartbeat.log
+
+# ==== Binaries ====
+ngrok.exe
 
 # ==== Dữ liệu đầu vào của người dùng ====
 creators.xlsx

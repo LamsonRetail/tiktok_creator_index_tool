@@ -61,6 +61,7 @@ FIELD_CATALOG = [
     {"key": "live_share_avg", "label": "Lượt chia sẻ LIVE trung bình", "group": "LIVE"},
 
     # NGƯỜI THEO DÕI
+    {"key": "follower_count", "label": "Số người theo dõi", "group": "Người theo dõi"},
     {"key": "follower_gender", "label": "Giới tính người theo dõi", "group": "Người theo dõi"},
     {"key": "follower_age", "label": "Độ tuổi người theo dõi", "group": "Người theo dõi"},
     {"key": "follower_location", "label": "Địa điểm hàng đầu", "group": "Người theo dõi"},
@@ -478,32 +479,29 @@ def _fmt_money(v) -> str:
 
 
 def _fmt_locations(lst, sep=" - ") -> str:
-    """Địa điểm hàng đầu: API trả số đếm thô -> quy ra % theo tổng các địa điểm trả về."""
+    """Địa điểm hàng đầu: API trả basis points × 100 (vd 3560 -> 35,60%), KHÔNG phải số lượng."""
     if not isinstance(lst, list) or not lst:
         return "N/A"
-    pairs, total = [], 0.0
+    parts = []
     for it in lst:
         if not isinstance(it, dict):
             continue
-        cnt = _to_num(it.get("value"))
+        val = _to_num(it.get("value"))
         name = it.get("key") or it.get("name")
-        if cnt is None or name is None:
+        if val is None or name is None:
             continue
-        pairs.append((name, cnt))
-        total += cnt
-    if not pairs or total <= 0:
-        return "N/A"
-    parts = []
-    for name, cnt in pairs:
-        p = f"{cnt / total * 100:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+        pct = val / 100.0
+        p = f"{pct:.2f}".rstrip("0").rstrip(".").replace(".", ",")
         parts.append(f"{name}: {p}%")
-    return sep.join(parts)
+    return sep.join(parts) if parts else "N/A"
 
 
-def _fmt_groups(lst, label_map=None, sep=" - ", use_name=False) -> str:
+def _fmt_groups(lst, label_map=None, sep=" - ", use_name=False, normalize=False) -> str:
+    """Nhóm tỉ lệ. Mặc định lấy nguyên ratio × 100.
+    `normalize=True`: chuẩn hoá lại sao cho tổng các nhãn trả về = 100% (vd Nam/Nữ bỏ unknown)."""
     if not isinstance(lst, list) or not lst:
         return "N/A"
-    parts = []
+    items = []
     for it in lst:
         if not isinstance(it, dict):
             continue
@@ -512,21 +510,40 @@ def _fmt_groups(lst, label_map=None, sep=" - ", use_name=False) -> str:
         else:
             key = it.get("key")
             label = (label_map or {}).get(key, key)
-        pct = _pct(it.get("value"))
-        if label is not None and pct is not None:
-            parts.append(f"{label}: {pct}")
-    return sep.join(parts) if parts else "N/A"
-
-
-def _interact_rate(cp, like_k, comment_k, share_k, view_k) -> str:
-    like = _to_num(_get(cp, like_k)) or 0
-    comment = _to_num(_get(cp, comment_k)) or 0
-    share = _to_num(_get(cp, share_k)) or 0
-    view = _to_num(_get(cp, view_k))
-    if not view:
+        val = _to_num(it.get("value"))
+        if label is None or val is None:
+            continue
+        items.append((label, val))
+    if not items:
         return "N/A"
-    rate = (like + comment + share) / view * 100
-    return f"{rate:.2f}".rstrip("0").rstrip(".").replace(".", ",") + "%"
+    if normalize:
+        total = sum(v for _, v in items)
+        if total <= 0:
+            return "N/A"
+        parts = []
+        for label, val in items:
+            p = f"{val / total * 100:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+            parts.append(f"{label}: {p}%")
+        return sep.join(parts)
+    parts = []
+    for label, val in items:
+        p = f"{val * 100:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+        parts.append(f"{label}: {p}%")
+    return sep.join(parts)
+
+
+def _fmt_engagement(v) -> str:
+    """video_engagement / live_engagement: TikTok lưu sẵn dưới dạng số nguyên scale × 100
+    (vd 44 -> 0,44%). Cách này khớp UI hơn là tự tính (like+comment+share)/view
+    vì TikTok còn cộng saved/completed view ... mà API không trả lẻ."""
+    if v is None:
+        return "N/A"
+    n = _to_num(v)
+    if n is None:
+        return "N/A"
+    pct = n / 100.0
+    s = f"{pct:.2f}".rstrip("0").rstrip(".")
+    return s.replace(".", ",") + "%"
 
 
 def map_profile_to_row(cp: Dict[str, Any], selected: Optional[set]) -> Dict[str, Any]:
@@ -545,36 +562,42 @@ def map_profile_to_row(cp: Dict[str, Any], selected: Optional[set]) -> Dict[str,
     put("sales_chart_category", _fmt_groups(_get(cp, "industry_groups"), use_name=True))
 
     # COLLAB
-    freq = _get(cp, "ec_video_publish_cnt_30d", "video_publish_cnt_30d")
+    # UI hiển thị "tất cả video" -> ưu tiên field non-EC, EC làm fallback.
+    freq = _get(cp, "video_publish_cnt_30d", "ec_video_publish_cnt_30d")
     put("collab_freq", f"{freq} video/30 ngày" if freq not in (None, "") else "N/A")
-    put("collab_comm", _fmt_metric(_get(cp, "med_commission_rate", "med_commission_rate_range")))
+    # Commission rate cũng là basis points × 100 (vd 750 -> 7,5%).
+    put("collab_comm", _fmt_engagement(_get(cp, "med_commission_rate", "med_commission_rate_range")))
     put("collab_prods", _fmt_metric(_get(cp, "promoted_product_num", "product_cnt")))
     put("collab_brands", _fmt_metric(_get(cp, "collaborated_brands_num")))
     put("collab_price", _fmt_money(_get(cp, "product_price_range")))
 
-    # VIDEO (ưu tiên chỉ số EC, fallback chỉ số thường)
+    # VIDEO: ưu tiên chỉ số toàn bộ video (khớp UI "Lượt xem/Tỷ lệ tương tác trung bình"),
+    # ec_* dùng làm fallback nếu creator chỉ có dữ liệu e-com.
     put("video_gpm", _fmt_money(_get(cp, "ec_video_gpm")))
-    put("video_count", _fmt_metric(_get(cp, "ec_video_publish_cnt_30d", "video_publish_cnt_30d")))
-    put("video_view_avg", _fmt_metric(_get(cp, "ec_video_med_view_cnt", "video_med_view_cnt")))
-    put("video_interact_avg", _interact_rate(cp, "ec_video_med_like_cnt", "ec_video_med_comment_cnt",
-                                             "ec_video_med_share_cnt", "ec_video_med_view_cnt"))
-    put("video_like_avg", _fmt_metric(_get(cp, "ec_video_med_like_cnt", "video_med_like_cnt")))
-    put("video_comment_avg", _fmt_metric(_get(cp, "ec_video_med_comment_cnt", "video_med_comment_cnt")))
-    put("video_share_avg", _fmt_metric(_get(cp, "ec_video_med_share_cnt", "video_med_share_cnt")))
+    put("video_count", _fmt_metric(_get(cp, "video_publish_cnt_30d", "ec_video_publish_cnt_30d")))
+    put("video_view_avg", _fmt_metric(_get(cp, "video_med_view_cnt", "ec_video_med_view_cnt")))
+    put("video_interact_avg", _fmt_engagement(_get(cp, "video_engagement", "ec_video_engagement")))
+    put("video_like_avg", _fmt_metric(_get(cp, "video_med_like_cnt", "ec_video_med_like_cnt")))
+    put("video_comment_avg", _fmt_metric(_get(cp, "video_med_comment_cnt", "ec_video_med_comment_cnt")))
+    put("video_share_avg", _fmt_metric(_get(cp, "video_med_share_cnt", "ec_video_med_share_cnt")))
 
     # LIVE
     put("live_gpm", _fmt_money(_get(cp, "ec_live_gpm")))
-    put("live_count", _fmt_metric(_get(cp, "ec_live_streaming_cnt_30d", "live_streaming_cnt_30d")))
-    put("live_view_avg", _fmt_metric(_get(cp, "ec_live_med_view_cnt", "live_med_view_cnt")))
-    put("live_interact_avg", _interact_rate(cp, "ec_live_med_like_cnt", "ec_live_med_comment_cnt",
-                                            "ec_live_med_share_cnt", "ec_live_med_view_cnt"))
-    put("live_like_avg", _fmt_metric(_get(cp, "ec_live_med_like_cnt", "live_med_like_cnt")))
-    put("live_comment_avg", _fmt_metric(_get(cp, "ec_live_med_comment_cnt", "live_med_comment_cnt")))
-    put("live_share_avg", _fmt_metric(_get(cp, "ec_live_med_share_cnt", "live_med_share_cnt")))
+    put("live_count", _fmt_metric(_get(cp, "live_streaming_cnt_30d", "ec_live_streaming_cnt_30d")))
+    put("live_view_avg", _fmt_metric(_get(cp, "live_med_view_cnt", "ec_live_med_view_cnt")))
+    put("live_interact_avg", _fmt_engagement(_get(cp, "live_engagement", "ec_live_engagement")))
+    put("live_like_avg", _fmt_metric(_get(cp, "live_med_like_cnt", "ec_live_med_like_cnt")))
+    put("live_comment_avg", _fmt_metric(_get(cp, "live_med_comment_cnt", "ec_live_med_comment_cnt")))
+    put("live_share_avg", _fmt_metric(_get(cp, "live_med_share_cnt", "ec_live_med_share_cnt")))
 
     # FOLLOWERS
-    put("follower_gender", _fmt_groups(_get(cp, "follower_genders_v2"), label_map=_GENDER_LABELS))
-    put("follower_age", _fmt_groups(_get(cp, "follower_ages_v2"), sep=" / "))
+    #  - Gender/Age: API trả ratio nhưng có thể không cộng đủ 100% (gender bỏ unknown),
+    #    nên chuẩn hoá lại đúng như TikTok UI.
+    #  - Location: dùng follower_cnt làm mẫu số -> % "thật" so với tổng follower.
+    fc = _get(cp, "follower_cnt")
+    put("follower_count", _vn_int(fc) if fc not in (None, "") else "N/A")
+    put("follower_gender", _fmt_groups(_get(cp, "follower_genders_v2"), label_map=_GENDER_LABELS, normalize=True))
+    put("follower_age", _fmt_groups(_get(cp, "follower_ages_v2"), sep=" / ", normalize=True))
     put("follower_location", _fmt_locations(_get(cp, "follower_state_location")))
 
     return row
